@@ -5,32 +5,27 @@ import platform
 import time
 import psutil
 import datetime
-import asyncio
 import socket
 import re
 import json
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union
 
 """
-运行状态 - LangBot 插件版本
-查询系统资源使用情况并美观展示
+运行状态 - LangBot 插件
+查询系统资源使用情况并美观展示，只允许管理员使用
 """
 
 # 配置项
 CONFIG = {
-    "delMsgTime": 90,      # 消息保留时间(秒)
+    "admin_ids": ["your_admin_id"],  # 管理员ID列表，请替换为您的管理员ID
     "progressBarLength": 15,   # 进度条长度
-    "refreshInterval": None,   # 刷新间隔(秒)，设为None表示不自动刷新
-    "networkHistory": {},      # 存储上次网络数据以计算速率
-    "maxDisksToShow": 10,      # 最多显示几个磁盘，设置为较大的数值以显示所有磁盘
-    "preferredInterfaces": ['enp3s0', 'enp4s0', 'eth0', 'eth1', 'wlan0', 'wlan1'], # 优先选择的网卡，按优先级排序
     "hideNetworkAddresses": True,  # 是否隐藏IP地址和MAC地址
-    "maxNetworksToShow": 15,   # 最多显示几个网卡
-    "showAllNetworks": True    # 是否显示所有网卡
+    "maxDisksToShow": 10,      # 最多显示几个磁盘
+    "maxNetworksToShow": 5,    # 最多显示几个网卡
 }
 
 # 注册插件
-@register(name="SystemStatus", description="查询系统资源使用情况并美观展示", version="1.0.0", author="seven")
+@register(name="SystemStatus", description="查询系统资源使用情况，只允许管理员使用", version="1.0.0", author="LangBot")
 class SystemStatusPlugin(BasePlugin):
 
     # 插件加载时触发
@@ -38,6 +33,9 @@ class SystemStatusPlugin(BasePlugin):
         self.host = host
         self.logger = host.logger
         self.logger.info("运行状态插件已加载")
+        
+        # 加载配置
+        self._load_config()
         
         # 初始化网络历史数据
         self.network_history = {}
@@ -47,12 +45,47 @@ class SystemStatusPlugin(BasePlugin):
     async def initialize(self):
         pass
 
+    # 加载配置
+    def _load_config(self):
+        config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        
+        # 如果配置文件存在，则加载配置
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    loaded_config = json.load(f)
+                    CONFIG.update(loaded_config)
+                    self.logger.info("已加载配置文件")
+            except Exception as e:
+                self.logger.error(f"加载配置文件失败: {e}")
+        else:
+            # 创建默认配置文件
+            try:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+                    self.logger.info("已创建默认配置文件")
+            except Exception as e:
+                self.logger.error(f"创建配置文件失败: {e}")
+
+    # 检查用户是否为管理员
+    def _is_admin(self, user_id: str) -> bool:
+        return user_id in CONFIG["admin_ids"]
+
     # 当收到个人消息时触发
     @handler(PersonNormalMessageReceived)
     async def on_person_message(self, ctx: EventContext):
         message = ctx.event.text_message
+        sender_id = ctx.event.sender_id
+        
         if message == "运行状态":
-            self.logger.info(f"用户 {ctx.event.sender_id} 请求查看系统运行状态")
+            # 检查是否为管理员
+            if not self._is_admin(sender_id):
+                self.logger.info(f"非管理员用户 {sender_id} 尝试查看系统运行状态，已拒绝")
+                ctx.add_return("reply", ["抱歉，只有管理员才能查看系统运行状态"])
+                ctx.prevent_default()
+                return
+                
+            self.logger.info(f"管理员 {sender_id} 请求查看系统运行状态")
             
             # 获取系统信息
             system_info = await self.get_system_info()
@@ -62,13 +95,24 @@ class SystemStatusPlugin(BasePlugin):
             
             # 阻止默认行为
             ctx.prevent_default()
+            return
 
     # 当收到群消息时触发
     @handler(GroupNormalMessageReceived)
     async def on_group_message(self, ctx: EventContext):
         message = ctx.event.text_message
+        sender_id = ctx.event.sender_id
+        group_id = ctx.event.group_id
+        
         if message == "运行状态":
-            self.logger.info(f"群 {ctx.event.group_id} 的用户 {ctx.event.sender_id} 请求查看系统运行状态")
+            # 检查是否为管理员
+            if not self._is_admin(sender_id):
+                self.logger.info(f"非管理员用户 {sender_id} 在群 {group_id} 尝试查看系统运行状态，已拒绝")
+                ctx.add_return("reply", ["抱歉，只有管理员才能查看系统运行状态"])
+                ctx.prevent_default()
+                return
+                
+            self.logger.info(f"管理员 {sender_id} 在群 {group_id} 请求查看系统运行状态")
             
             # 获取系统信息
             system_info = await self.get_system_info()
@@ -78,6 +122,7 @@ class SystemStatusPlugin(BasePlugin):
             
             # 阻止默认行为
             ctx.prevent_default()
+            return
 
     # 获取系统信息
     async def get_system_info(self) -> str:
@@ -96,7 +141,10 @@ class SystemStatusPlugin(BasePlugin):
             if not disk_info:
                 disk_section += "│ 未能获取磁盘信息\n"
             else:
-                for i, disk in enumerate(disk_info):
+                # 限制显示的磁盘数量
+                disks_to_show = disk_info[:CONFIG["maxDisksToShow"]]
+                
+                for i, disk in enumerate(disks_to_show):
                     if i > 0:
                         disk_section += "│\n"  # 磁盘之间添加空行
                     
@@ -106,6 +154,10 @@ class SystemStatusPlugin(BasePlugin):
                     disk_section += f"│ 总空间: {disk['total']}\n"
                     disk_section += f"│ 已用空间: {disk['used']} {self.format_progress_bar(disk['percent'])}\n"
                     disk_section += f"│ 可用空间: {disk['available']}\n"
+                
+                # 如果有更多磁盘未显示，添加提示
+                if len(disk_info) > CONFIG["maxDisksToShow"]:
+                    disk_section += f"│\n│ (还有 {len(disk_info) - CONFIG['maxDisksToShow']} 个磁盘未显示)\n"
             
             # 构建网络信息部分
             network_section = f"{self.format_separator('🌐 网络信息')}\n"
@@ -123,8 +175,8 @@ class SystemStatusPlugin(BasePlugin):
                     )
                 )
                 
-                # 确定要显示的网卡数量
-                networks_to_show = sorted_networks if CONFIG["showAllNetworks"] else sorted_networks[:CONFIG["maxNetworksToShow"]]
+                # 限制显示的网卡数量
+                networks_to_show = sorted_networks[:CONFIG["maxNetworksToShow"]]
                 
                 for i, network in enumerate(networks_to_show):
                     if i > 0:
@@ -137,8 +189,8 @@ class SystemStatusPlugin(BasePlugin):
                     network_section += f"│ 上传速度: {network['tx']}/s (总计: {network['tx_total']})\n"
                     network_section += f"│ 连接状态: {network['status']}\n"
                 
-                # 如果限制了显示数量且有更多网卡未显示，添加提示
-                if not CONFIG["showAllNetworks"] and len(sorted_networks) > CONFIG["maxNetworksToShow"]:
+                # 如果有更多网卡未显示，添加提示
+                if len(sorted_networks) > CONFIG["maxNetworksToShow"]:
                     network_section += f"│\n│ (还有 {len(sorted_networks) - CONFIG['maxNetworksToShow']} 个网卡未显示)\n"
             
             # 构建完整信息
@@ -146,7 +198,7 @@ class SystemStatusPlugin(BasePlugin):
 {self.format_separator('🖥️ 系统信息')}
 │
 │ 运行时间: {uptime_info['formatted']}
-│ Python版本: {platform.python_version()}
+│ 版本: {platform.python_version()}
 │ 操作系统: {platform.system()} {platform.release()}
 │ 主机名: {socket.gethostname()}
 │ 
